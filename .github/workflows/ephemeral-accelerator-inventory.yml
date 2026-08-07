@@ -1,0 +1,75 @@
+name: Ephemeral Accelerator Inventory
+
+# Reports what accelerator each ephemeral self-hosted target actually exposes
+# to a job. Lemonade dispatches to different backends depending on the silicon
+# it finds, so "which device does CI really see" is worth asserting rather
+# than assuming.
+#
+# Every job here runs on a runner that does not exist until the job is queued:
+# the orchestrator provisions it on demand, registers it as --ephemeral, and
+# destroys it afterwards. The two r9700 targets are a Linux and a Windows VM
+# bound to the same physical GPU, so they are serialised by the orchestrator
+# rather than run in parallel.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  inventory-linux-stx:
+    name: Ryzen AI STX - Linux (bare metal)
+    runs-on: [self-hosted, Linux, stx]
+    steps:
+      - name: Host
+        run: |
+          echo "runner: ${{ runner.name }} (${{ runner.os }}/${{ runner.arch }})"
+          echo "host:   $(hostname)"
+          echo "kernel: $(uname -r)"
+      - name: CPU
+        run: lscpu | grep -iE 'model name|^cpu\(s\)' || true
+      - name: Accelerators
+        run: lspci -nn | grep -iE 'vga|display|processing accelerator' || echo "none reported"
+
+  inventory-windows-stx:
+    name: Ryzen AI STX - Windows (bare metal)
+    runs-on: [self-hosted, Windows, stx]
+    steps:
+      - name: Host
+        run: |
+          Write-Output "runner: ${{ runner.name }} (${{ runner.os }}/${{ runner.arch }})"
+          Write-Output "host:   $env:COMPUTERNAME"
+          Write-Output "os:     $((Get-CimInstance Win32_OperatingSystem).Caption)"
+      - name: CPU
+        run: Get-CimInstance Win32_Processor | Select-Object Name, NumberOfCores | Format-List
+      - name: Accelerators
+        run: Get-CimInstance Win32_VideoController | Select-Object Name, DriverVersion, Status | Format-List
+
+  inventory-linux-r9700:
+    name: Radeon AI PRO R9700 - Linux (ephemeral VM)
+    runs-on: [self-hosted, Linux, r9700]
+    steps:
+      - name: Host
+        run: |
+          echo "runner: ${{ runner.name }} (${{ runner.os }}/${{ runner.arch }})"
+          echo "host:   $(hostname)"
+          echo "kernel: $(uname -r)"
+      - name: CPU
+        run: lscpu | grep -iE 'model name|^cpu\(s\)' || true
+      - name: Accelerators
+        run: lspci -nn | grep -iE 'vga|display|processing accelerator' || echo "none reported"
+
+  inventory-windows-r9700:
+    name: Radeon AI PRO R9700 - Windows (ephemeral VM)
+    runs-on: [self-hosted, Windows, r9700]
+    steps:
+      - name: Host
+        run: |
+          Write-Output "runner: ${{ runner.name }} (${{ runner.os }}/${{ runner.arch }})"
+          Write-Output "host:   $env:COMPUTERNAME"
+          Write-Output "os:     $((Get-CimInstance Win32_OperatingSystem).Caption)"
+      - name: CPU
+        run: Get-CimInstance Win32_Processor | Select-Object Name, NumberOfCores | Format-List
+      - name: Accelerators
+        run: Get-CimInstance Win32_VideoController | Select-Object Name, DriverVersion, Status | Format-List
