@@ -1,0 +1,56 @@
+name: DevLab Accelerator Inventory
+
+# Drop into lemonade-ephemeral-poc as .github/workflows/devlab-halo.yml
+#
+# Reports what the Strix Halo host actually exposes to a job. Lemonade
+# dispatches to different backends depending on the silicon it finds, so "which
+# device does CI really see" is worth asserting rather than assuming -- and the
+# answer on an iGPU/NPU part is not the answer on a discrete card.
+#
+# The runner does not exist until the job is queued: the DevLab orchestrator
+# provisions it in one of the runner slots on the Halo host, registers it as
+# --ephemeral, and removes it afterwards.
+#
+# The `halo` label is what routes these jobs to DevLab. The `stx` and `r9700`
+# jobs in ephemeral-accelerator-inventory.yml stay on the XSJ pool, so both
+# pools can serve this repository without either claiming the other's work.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  inventory-linux-halo:
+    name: Strix Halo - Linux
+    runs-on: [self-hosted, Linux, halo]
+    steps:
+      - name: Host
+        run: |
+          echo "runner: ${{ runner.name }} (${{ runner.os }}/${{ runner.arch }})"
+          echo "host:   $(hostname)"
+          echo "kernel: $(uname -r)"
+      - name: CPU
+        run: lscpu | grep -iE 'model name|^cpu\(s\)' || true
+      - name: Memory
+        run: free -h
+      - name: Accelerators
+        run: lspci -nn | grep -iE 'vga|display|processing accelerator' || echo "none reported"
+      - name: ROCm devices
+        run: rocminfo 2>/dev/null | grep -iE 'name:|gfx' | head -20 || echo "rocminfo not installed"
+
+  # A clean runner means no toolchain unless the job installs one. What that
+  # costs is the tiering question -- image, cache mount, or job time -- so it is
+  # worth timing rather than guessing.
+  cold-start-cost:
+    name: Strix Halo - what a clean runner costs
+    runs-on: [self-hosted, Linux, halo]
+    steps:
+      - uses: actions/checkout@v5
+      - name: Time a dependency install
+        run: |
+          start=$(date +%s)
+          python3 -m venv /tmp/venv-$$ && /tmp/venv-$$/bin/pip install -q --upgrade pip
+          echo "venv + pip upgrade: $(( $(date +%s) - start ))s"
+          rm -rf /tmp/venv-$$
