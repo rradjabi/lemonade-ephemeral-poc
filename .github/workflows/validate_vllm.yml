@@ -241,6 +241,165 @@ jobs:
           pkill -9 -f "resource_tracker" 2>/dev/null || true
 
   # ========================================================================
+  # Validate the same backend on the AMD DevLab ephemeral pool
+  #
+  # A copy of the validate job above, differing only in runs-on: it is pinned
+  # to the ephemeral pool, which provisions a VM per job and destroys it
+  # afterwards. It runs alongside the lemon-prod job rather than replacing it,
+  # so the two can be compared run for run on the same commit and the same
+  # build artifact.
+  #
+  # It is continue-on-error and create-pr does not depend on it, so a pool on
+  # trial can neither gate nor produce a release PR. Only the persistent job
+  # can do that, exactly as before. Its artifacts are named ephemeral-* rather
+  # than *-ephemeral so they stay outside create-pr's validation-results-*
+  # download pattern -- otherwise merge-multiple would collide two different
+  # runs' vllm_validation_rocm.json onto each other.
+  #
+  # When lemon-prod is decommissioned: delete the validate job above, drop the
+  # -ephemeral suffixes here, and point create-pr's needs at this job. To call
+  # the trial off: delete this job.
+  # ========================================================================
+  validate-ephemeral:
+    name: Validate vllm (rocm) [ephemeral]
+    needs: [get-latest-releases, build]
+    if: always() && needs.build.result == 'success'
+    runs-on: [self-hosted, Linux, strix-halo, ephemeral]
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          clean: true
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v7
+        with:
+          name: vllm-build
+          path: build
+
+      - name: Verify binaries
+        run: |
+          set -e
+          chmod +x build/lemond build/lemonade
+          ./build/lemond --version
+          echo "Binaries verified!"
+
+      - name: Setup Python and virtual environment
+        uses: ./.github/actions/setup-venv
+        with:
+          venv-name: '.venv'
+          python-version: '3.10'
+          requirements-file: 'test/requirements.txt'
+
+      - name: Run validation with lemond
+        env:
+          HOME: ${{ github.workspace }}/.home
+        run: |
+          set -e
+          mkdir -p "$HOME"
+          echo "HOME=$HOME" >> "$GITHUB_ENV"
+
+          CACHE_DIR="$(pwd)/ci-cache-vllm"
+          LOGS_DIR="$(pwd)/server-logs-rocm"
+          mkdir -p "$CACHE_DIR" "$LOGS_DIR"
+          mkdir -p "$RUNNER_TEMP/xdg-runtime"
+          chmod 700 "$RUNNER_TEMP/xdg-runtime"
+          echo "XDG_RUNTIME_DIR=$RUNNER_TEMP/xdg-runtime" >> "$GITHUB_ENV"
+          export XDG_RUNTIME_DIR="$RUNNER_TEMP/xdg-runtime"
+
+          # Kept identical to the persistent job so the two are comparable.
+          # An ephemeral runner is the only job on its VM, so nothing else can
+          # hold 13305 -- the port dance below is redundant here, not wrong. lemond now refuses to
+          # bind an in-use port, so start on a job-unique free port and pass it to
+          # validate_vllm.py and the shutdown call.
+          pick_free_port() {
+            if command -v python3 >/dev/null 2>&1; then
+              python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()' && return 0
+            fi
+            for _ in $(seq 1 50); do
+              local p=$(( (RANDOM % 20000) + 20000 ))
+              if ! ss -ltn 2>/dev/null | grep -q ":$p "; then echo "$p"; return 0; fi
+            done
+            return 1
+          }
+
+          LEMOND_PID=""
+          started=0
+          for start_attempt in $(seq 1 5); do
+            PORT=$(pick_free_port) || { echo "ERROR: could not find a free port"; exit 1; }
+            echo "Attempt $start_attempt: starting lemond on 127.0.0.1:$PORT..."
+            ./build/lemond "$CACHE_DIR" --port "$PORT" --host 127.0.0.1 \
+              > "$LOGS_DIR/lemond.stdout.log" 2> "$LOGS_DIR/lemond.stderr.log" &
+            LEMOND_PID=$!
+            for i in $(seq 1 30); do
+              if curl -sf "http://127.0.0.1:$PORT/api/v1/health" > /dev/null 2>&1; then
+                echo "lemond is healthy on port $PORT (PID $LEMOND_PID)"
+                started=1
+                break
+              fi
+              if ! kill -0 "$LEMOND_PID" 2>/dev/null; then
+                echo "lemond (PID $LEMOND_PID) exited prematurely on port $PORT"
+                cat "$LOGS_DIR/lemond.stderr.log" 2>/dev/null || true
+                break
+              fi
+              sleep 2
+            done
+            [ "$started" = "1" ] && break
+            echo "Start attempt $start_attempt failed; retrying on a new port..."
+            kill -9 "$LEMOND_PID" 2>/dev/null || true
+            sleep 1
+          done
+          if [ "$started" != "1" ]; then
+            echo "ERROR: lemond failed to start after multiple attempts"
+            exit 1
+          fi
+
+          EXIT_CODE=0
+          VALIDATION_ARGS=(
+            test/validate_vllm.py
+            --backend rocm
+            --port "$PORT"
+            --output vllm_validation_rocm.json
+            --logs-dir "$LOGS_DIR"
+          )
+          if [ "${LITE_MODE}" = "true" ]; then
+            VALIDATION_ARGS+=(--lite)
+          fi
+
+          .venv/bin/python "${VALIDATION_ARGS[@]}" || EXIT_CODE=$?
+
+          # Shut the server down cleanly so logs flush.
+          curl -sf -X POST "http://127.0.0.1:$PORT/internal/shutdown" || true
+          sleep 2
+          kill $LEMOND_PID 2>/dev/null || true
+
+          exit $EXIT_CODE
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: ephemeral-validation-results-rocm
+          path: vllm_validation_rocm.json
+          retention-days: 30
+
+      - name: Upload server logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: ephemeral-server-logs-rocm
+          path: server-logs-rocm/
+          retention-days: 30
+          if-no-files-found: ignore
+
+      - name: Cleanup
+        if: always()
+        run: |
+          pkill -9 -f lemond 2>/dev/null || true
+          pkill -9 -f "vllm" 2>/dev/null || true
+          pkill -9 -f "resource_tracker" 2>/dev/null || true
+
+  # ========================================================================
   # Create PR if validation passed (schedule or workflow_dispatch only)
   # ========================================================================
   create-pr:
